@@ -4,7 +4,7 @@ This repository implements the minimal finite covering problem and its applicati
 <img src="DIKU_mcs_0.05.png" width=500/>
 
 ## Requirements
-torch, numpy, scipy, gurobipy (liscence is required)
+torch, numpy, scipy, gurobipy (license is required)
 
 ## Basic Usage
 Finite covering with fixed number $k$ and minimum radius $\eta$.
