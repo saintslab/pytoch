@@ -4,6 +4,7 @@ from tqdm import tqdm
 import gurobipy as gp
 from gurobipy import GRB
 import numpy as np
+from scipy import sparse as sp
 
 
 class MFC():
@@ -36,7 +37,27 @@ class MFC():
 
         return A
 
-    def mfc(self, A, eta=0, k=False):
+    def mfc_convex(self, A, eta=0):
+        """
+        LP relaxation of minimum finite covering problem
+        Inputs:
+            A: distance matrix
+            eta: radius of covering balls
+        """
+        A_adj = sp.csr_matrix(A <= eta)
+        n1, n2 = A_adj.shape
+        m = gp.Model("LP")
+        m.setParam("OutputFlag", 0)
+        s = m.addMVar(shape=n2, vtype=GRB.CONTINUOUS, name="s")
+        obj = s.sum()
+        m.setObjective(obj, GRB.MINIMIZE)
+        m.addConstr(A_adj @ s >= np.ones(n1), name="c")
+
+        m.optimize()
+
+        return s.X
+
+    def mfc(self, A, eta=0, k=False, relax=False):
         """
         Solve minimum finite covering problem
         Inputs:
@@ -44,22 +65,41 @@ class MFC():
             eta: radius of covering balls
             k: number of covering balls
         """
-        A_eta = 1 * (A <= eta)
-        n = A.shape[0]
+        if relax:
+            n = A.shape[0]
+            l = list(range(0, n, 5000))
+            if len(l) > 1:
+                l[-1] = n
+            else:
+                l = [0, n]
+            sol_total = np.zeros(n)
+            for i in range(len(l) - 1):
+                sol = self.mfc_convex(A[l[i]:l[i+1], :], eta)
+                sol_total += sol
+            idx = sol_total.nonzero()[0]
+            A_adj = sp.csr_matrix(A[:, idx] <= eta)
+        else:
+            A_adj = sp.csr_matrix(A <= eta)
+        n1, n2 = A_adj.shape[0]
         m = gp.Model("MILP")
-        m.setParam("TimeLimit", 500)
         m.setParam("OutputFlag", 0)
-        s = m.addMVar(shape=n, vtype=GRB.BINARY, name="s")
+        s = m.addMVar(shape=n2, vtype=GRB.BINARY, name="s")
         obj = s.sum()
         m.setObjective(obj, GRB.MINIMIZE)
-        m.addConstr(A_eta.numpy() @ s >= np.ones(n), name="c")
+        m.addConstr(A_adj.numpy() @ s >= np.ones(n1), name="c")
         if k:
             m.addConstr(obj == k, name='c0')
 
         m.optimize()
 
         if m.status == 2:  # 2 optimal; 3 infeasible; 4 infeasible or unbounded; 5 unbounded; 9 time_limit; 12 numeric; 13 suboptimal; 14 inprogress; 17 mem_limit.
-            return s.X, s.X.sum()
+            if relax:
+                v = np.zeros(n1)
+                for i, id in enumerate(idx):
+                    v[id] = s.X[i]
+                return v, v.sum()
+            else:
+                return s.X, s.X.sum()
         else:
             return None
 
