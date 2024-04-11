@@ -64,6 +64,7 @@ class MFC():
             A: distance matrix
             eta: radius of covering balls
             k: number of covering balls
+            relax: approximation using LP relaxation
         """
         if relax:
             n = A.shape[0]
