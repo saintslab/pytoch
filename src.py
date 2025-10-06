@@ -3,6 +3,8 @@ import torch.nn as nn
 from tqdm import tqdm
 import gurobipy as gp
 from gurobipy import GRB
+import pulp as pl
+import pyscipopt as scip
 import numpy as np
 from scipy import sparse as sp
 
@@ -22,7 +24,7 @@ class MFC():
         self.norm = norm
         self.num_lim = num_lim
 
-    def adjcentMatrix(self):
+    def distanceMatrix(self):
         """
         Generate distance matrix for given dataset
         """
@@ -37,7 +39,7 @@ class MFC():
 
         return A
 
-    def mfc_convex(self, A, eta=0):
+    def mfc_gurobi_continuous(self, A, eta=0):
         """
         LP relaxation of minimum finite covering problem
         Inputs:
@@ -55,18 +57,40 @@ class MFC():
 
         m.optimize()
 
-        return s.X
+        return s.X, m.Runtime
 
-    def mfc(self, A, eta=0, k=False, relax=False):
+    def mfc(self, A, eta=0, k=False, solver='gurobi_relax'):
         """
         Solve minimum finite covering problem
         Inputs:
             A: distance matrix
             eta: radius of covering balls
             k: number of covering balls
-            relax: approximation using LP relaxation
+            solver: choice of solvers
+                "gurobi": GUROBI solver (https://www.gurobi.com/)
+                "gurobi_relax": GUROBI with LP relaxation
+                "cbc": CBC solver (https://github.com/coin-or/Cbc) from PuLP (https://github.com/coin-or/pulp) interface
+                "scip": SCIP solver (https://www.scipopt.org/)
         """
-        if relax:
+        if solver == 'gurobi':
+            A_adj = sp.csr_matrix(A <= eta)
+            n1, n2 = A_adj.shape
+            m = gp.Model("MILP")
+            m.setParam("OutputFlag", 0)
+            m.setParam("TimeLimit", 3000)
+            s = m.addMVar(shape=n2, vtype=GRB.BINARY, name="s")
+            obj = s.sum()
+            m.setObjective(obj, GRB.MAXIMIZE)
+            m.addConstr(A_adj @ s >= np.ones(n1), name="c")
+            if k:
+                m.addConstr(obj == k, name='c0')
+            m.optimize()
+
+            if m.status == 2:  # 2 optimal; 3 infeasible; 4 infeasible or unbounded; 5 unbounded; 9 time_limit; 12 numeric; 13 suboptimal; 14 inprogress; 17 mem_limit.
+                return s.X, m.Runtime
+            else:
+                return None, m.Runtime
+        elif solver == 'gurobi_relax':
             n = A.shape[0]
             l = list(range(0, n, 5000))
             if len(l) > 1:
@@ -74,35 +98,77 @@ class MFC():
             else:
                 l = [0, n]
             sol_total = np.zeros(n)
+            t_total = 0
             for i in range(len(l) - 1):
-                sol = self.mfc_convex(A[l[i]:l[i+1], :], eta)
+                sol, t = self.mfc_gurobi_continuous(A[l[i]:l[i + 1], :], eta)
                 sol_total += sol
+                t_total += t
             idx = sol_total.nonzero()[0]
-            A_adj = sp.csr_matrix(A[:, idx] <= eta)
-        else:
-            A_adj = sp.csr_matrix(A <= eta)
-        n1, n2 = A_adj.shape[0]
-        m = gp.Model("MILP")
-        m.setParam("OutputFlag", 0)
-        s = m.addMVar(shape=n2, vtype=GRB.BINARY, name="s")
-        obj = s.sum()
-        m.setObjective(obj, GRB.MINIMIZE)
-        m.addConstr(A_adj.numpy() @ s >= np.ones(n1), name="c")
-        if k:
-            m.addConstr(obj == k, name='c0')
-
-        m.optimize()
-
-        if m.status == 2:  # 2 optimal; 3 infeasible; 4 infeasible or unbounded; 5 unbounded; 9 time_limit; 12 numeric; 13 suboptimal; 14 inprogress; 17 mem_limit.
-            if relax:
-                v = np.zeros(n1)
-                for i, id in enumerate(idx):
-                    v[id] = s.X[i]
-                return v, v.sum()
+            if len(idx) <= k:
+                return np.ceil(sol_total), t_total  # m.ObjVal
             else:
-                return s.X, s.X.sum()
-        else:
-            return None
+                A_adj = sp.csr_matrix(A[:, idx] <= eta)
+                n1, n2 = A_adj.shape
+                m = gp.Model("MILP")
+                m.setParam("OutputFlag", 0)
+                m.setParam("TimeLimit", 3000)
+                s = m.addMVar(shape=n2, vtype=GRB.BINARY, name="s")
+                obj = s.sum()
+                m.setObjective(obj, GRB.MINIMIZE)
+                m.addConstr(A_adj @ s >= np.ones(n1), name="c")
+                if k:
+                    m.addConstr(obj == k, name='c0')
+                m.optimize()
+
+                if m.status == 2:  # 2 optimal; 3 infeasible; 4 infeasible or unbounded; 5 unbounded; 9 time_limit; 12 numeric; 13 suboptimal; 14 inprogress; 17 mem_limit.
+                    v = np.zeros(n1)
+                    for i, id in enumerate(idx):
+                        v[id] = s.X[i]
+                    return v, t + m.Runtime  # m.ObjVal
+                else:
+                    return None, t + m.Runtime
+        elif solver == 'cbc':
+            A_adj = sp.csr_matrix(A <= eta)
+            n1, n2 = A_adj.shape
+            m = pl.LpProblem("MILP", pl.LpMinimize)
+            s = pl.LpVariable.dicts("s", range(n2), cat=pl.LpBinary)
+            m += pl.lpSum([s[j] for i in range(n1) for j in A_adj[i].indices])
+            for i in range(n1):
+                indices = A_adj[i].indices
+                m += pl.lpSum([s[j] for j in indices]) >= 1, f"c_{i}"
+            if k:
+                m += pl.lpSum([s[j] for j in range(n2)]) == k, "c0"
+            solver = pl.PULP_CBC_CMD(msg=0, timeLimit=3000)
+            status = m.solve(solver)
+            if status == pl.LpStatusOptimal:
+                sol = np.array([pl.value(s[j]) for j in range(n2)])
+                return sol, m.solutionTime
+            else:
+                return None, m.solutionTime
+        elif solver == 'scip':
+            A_adj = sp.csr_matrix(A <= eta)
+            n1, n2 = A_adj.shape
+            m = scip.Model("MILP")
+            m.setPresolve(0)  # optional: turn off aggressive presolve if needed
+            m.setParam("limits/time", 3000)
+            m.hideOutput()  # suppress solver output
+            s = {}
+            for j in range(n2):
+                s[j] = m.addVar(vtype="B", name=f"s_{j}")
+            m.setObjective(scip.quicksum(s[j] for j in range(n2)), "maximize")
+            for i in range(n1):
+                indices = A_adj[i].indices
+                m.addCons(scip.quicksum(s[j] for j in indices) >= 1, name=f"c_{i}")
+            if k:
+                m.addCons(scip.quicksum(s[j] for j in range(n2)) == k, name="c0")
+            m.optimize()
+            status = m.getStatus()
+            if status == "optimal":
+                sol = np.array([m.getVal(s[j]) for j in range(n2)])
+                runtime = m.getSolvingTime()
+                return sol, runtime
+            else:
+                return None, m.getSolvingTime()
 
     def gen_data(self, A, eta=0, k=False, save=True):
         """
@@ -113,32 +179,40 @@ class MFC():
             k: number of covering balls
             save: save generated data points
         """
-        if k is False:
-            sol = self.mfc(A, eta)
-            if sol is None:
-                raise Exception('No feasible finite covering for fixed eta={:.3f}.'.format(eta))
-            else:
-                print('Minimum finite covering for fixed radius eta={:.3f}, got k={:.0f}.'.format(eta, sol[1]))
-        else:
+        t_total = 0
+        if k:
             eta_l, eta_u = 0, torch.max(A)
             print('Initial finite covering (enclosing ball) with k={:.0f}, eta={:.3f}.'.format(k, eta_u))
             i = 0
+            # while i <= 10:
             while eta_u - eta_l > 1e-3:
                 i += 1
                 print('Set bounds for eta: [%.3f, %.3f], gap: %.3f.' % (eta_l, eta_u, eta_u - eta_l))
                 eta = (eta_l + eta_u) / 2
-                sol = self.mfc(A, eta, k)
+                sol, t = self.mfc(A, eta, k, solver=solver)
+                t_total += t
                 if sol is None:
-                    print('Iter {}: \nNo feasible finite covering for fixed k={:.0f} and fixed eta={:.3f}.'.format(i, k, eta))
+                    print('Iter {}: \nNo feasible finite covering for fixed k={:.0f} and fixed eta={:.3f}.'.format(i, k,
+                                                                                                                   eta))
                     eta_l = eta
                 else:
-                    print('Iter {}: \nFound feasible finite covering for fixed k={:.0f} and fixed eta={:.3f}.'.format(i, k, eta))
+                    print('Iter {}: \nFound feasible finite covering for fixed k={:.0f} and fixed eta={:.3f}.'.format(i,
+                                                                                                                      k,
+                                                                                                                      eta))
                     eta_u = eta
             eta = eta_u
-            sol = self.mfc(A, eta, k)
+            sol, t = self.mfc(A, eta, k, solver=solver)
+            t_total += t
             print('Minimum finite covering for fixed k={:.0f}, got eta={:.3f}.\n'.format(k, eta))
+        else:
+            sol, t = self.mfc(A, eta, solver=solver)
+            t_total += t
+            if sol is None:
+                raise Exception('No feasible finite covering for fixed eta={:.3f}.'.format(eta))
+            else:
+                print('Minimum finite covering for fixed radius eta={:.3f}, got k={:.0f}.'.format(eta, sol[0].sum()))
 
-        idx = torch.nonzero(torch.tensor(sol[0])).reshape(-1)
+        idx = torch.nonzero(torch.tensor(sol)).reshape(-1)
         sub_data = torch.zeros(0)
         for i in range(len(idx)):
             sub_data = torch.cat((sub_data, self.data[idx[i]:idx[i] + 1]), 0)
@@ -147,7 +221,7 @@ class MFC():
             with open('data.npy', 'wb') as f:
                 torch.save(f, sub_data)
 
-        return sub_data, eta, sol
+        return sub_data, eta, sol, t_total
 
 
 class TR():
